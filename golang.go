@@ -3,6 +3,7 @@ package generator
 import (
 	"fmt"
 	"io"
+	"strings"
 )
 
 // WriteGolangHeader writes the file header for a generated Go source file to
@@ -30,6 +31,64 @@ func WriteGolangHeader(out io.Writer, src, pkg string, imports ...string) error 
 		fmt.Fprintf(out, "import %q", imports[0])
 		fmt.Fprintln(out)
 		_, err = fmt.Fprintln(out)
+	}
+
+	return err
+}
+
+// WriteGolangComment writes s as a comment to a Go source file.  The text
+// will be indented and word-wrapped as necessary.
+func WriteGolangComment(out io.Writer, s string, indentLevel, maxLineLen int) error {
+	var err error
+
+	col := 1
+	for off := 0; off < len(s); {
+		first := false
+		if col == 1 {
+			for i := 0; i < indentLevel; i++ {
+				out.Write([]byte{'\t'})
+				col += 8
+			}
+			if _, err = out.Write([]byte{'/', '/', ' '}); err != nil {
+				break
+			}
+			col += 3
+			first = true
+		}
+
+		var word string
+		var sp byte
+		brk := strings.IndexAny(s[off:], " \t\n")
+		if brk == -1 {
+			word = s[off:]
+			sp = '\n'
+			brk = len(s) - off
+		} else {
+			word = s[off : off+brk]
+			sp = s[off+brk]
+		}
+
+		// Ignore maxLineLen if this the first word on this line.
+		// This prevents an infinite loop for unwrappable words.
+		if col+len(word) > maxLineLen && !first {
+			out.Write([]byte{'\n'})
+			col = 1
+		} else {
+			switch sp {
+			case ' ':
+				col += len(word) + 1
+			case '\t':
+				col += len(word) + 8
+			case '\n':
+				col = 1
+			}
+
+			out.Write([]byte(word))
+			if _, err = out.Write([]byte{sp}); err != nil {
+				break
+			}
+			off += brk + 1
+		}
 	}
 
 	return err
