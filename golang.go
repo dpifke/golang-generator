@@ -3,7 +3,6 @@ package generator
 import (
 	"fmt"
 	"io"
-	"strings"
 )
 
 // WriteGolangHeader writes the file header for a generated Go source file to
@@ -36,60 +35,165 @@ func WriteGolangHeader(out io.Writer, src, pkg string, imports ...string) error 
 	return err
 }
 
-// WriteGolangComment writes s as a comment to a Go source file.  The text
-// will be indented and word-wrapped as necessary.
-func WriteGolangComment(out io.Writer, s string, indentLevel, maxLineLen int) error {
-	var err error
+// GolangCommentWriter returns an io.WriteCloser to wrap an existing
+// io.Writer.  Data written will be formatted as Golang comments, including
+// word wrapping.  (If word wrapping is not desired, maxLineLen can be set to
+// zero.)
+//
+// indentLevel is the number of tab stops by which to indent the output.
+//
+// The caller *must* call Close() on the returned object when done writing, in
+// order to flush any buffered text.  Doing so will not close the underlying
+// io.Writer.
+func GolangCommentWriter(out io.Writer, indentLevel, maxLineLen int) io.WriteCloser {
+	return &golangCommentWriter{
+		out:         out,
+		indentLevel: indentLevel,
+		maxLineLen:  maxLineLen,
+	}
+}
 
-	col := 1
-	for off := 0; off < len(s); {
-		first := false
-		if col == 1 {
-			for i := 0; i < indentLevel; i++ {
-				out.Write([]byte{'\t'})
-				col += 8
-			}
-			if _, err = out.Write([]byte{'/', '/', ' '}); err != nil {
-				break
-			}
-			col += 3
-			first = true
+// golangCommentWriter is the package-private implementation returned by
+// GolangCommentWriter().
+type golangCommentWriter struct {
+	out         io.Writer // where to send formatted output
+	indentLevel int       // number of leading tabs
+	maxLineLen  int       // maximum characters per line
+	sp          []byte    // whitespace yet to be written
+	word        []byte    // word yet to be written
+	col         int       // column (0 indexed)
+	expectCol   int       // column if sp+word is written
+}
+
+// writeNewline outputs a newline, and performs related housekeeping.
+func (w *golangCommentWriter) writeNewline() error {
+	w.col = 0
+	w.expectCol = 0
+	_, err := w.out.Write([]byte{'\n'})
+	return err
+}
+
+// writeLineLeader outputs indentation and start-of-comment token.
+func (w *golangCommentWriter) writeLineLeader() error {
+	for i := 0; i < w.indentLevel; i++ {
+		if _, err := w.out.Write([]byte{'\t'}); err != nil {
+			return err
+		}
+		w.col += 8
+	}
+
+	if _, err := w.out.Write([]byte{'/', '/'}); err != nil {
+		return err
+	}
+	w.col += 2
+
+	return nil
+}
+
+// flushWord outputs the buffered whitespace and word, and resets the buffers.
+func (w *golangCommentWriter) flushWord() error {
+	if w.col == 0 {
+		if err := w.writeLineLeader(); err != nil {
+			return err
 		}
 
-		var word string
-		var sp byte
-		brk := strings.IndexAny(s[off:], " \t\n")
-		if brk == -1 {
-			word = s[off:]
-			sp = '\n'
-			brk = len(s) - off
-		} else {
-			word = s[off : off+brk]
-			sp = s[off+brk]
-		}
-
-		// Ignore maxLineLen if this the first word on this line.
-		// This prevents an infinite loop for unwrappable words.
-		if col+len(word) > maxLineLen && !first {
-			out.Write([]byte{'\n'})
-			col = 1
-		} else {
-			switch sp {
-			case ' ':
-				col += len(word) + 1
-			case '\t':
-				col += len(word) + 8
-			case '\n':
-				col = 1
+		if len(w.sp) == 0 && len(w.word) > 0 {
+			if _, err := w.out.Write([]byte{' '}); err != nil {
+				return err
 			}
-
-			out.Write([]byte(word))
-			if _, err = out.Write([]byte{sp}); err != nil {
-				break
-			}
-			off += brk + 1
+			w.col++
 		}
 	}
 
+	for i := 0; i < len(w.sp); i++ {
+		switch w.sp[i] {
+		case ' ':
+			w.col++
+		case '\t':
+			w.col += 8 - w.col%8
+		}
+
+		if _, err := w.out.Write([]byte{w.sp[i]}); err != nil {
+			return err
+		}
+	}
+
+	if _, err := w.out.Write(w.word); err != nil {
+		return err
+	}
+
+	w.col += len(w.word)
+	w.expectCol = w.col
+
+	w.sp = []byte{}
+	w.word = []byte{}
+
+	return nil
+}
+
+func (w *golangCommentWriter) Write(b []byte) (int, error) {
+	for i, j := 0, 0; j < len(b); j++ {
+		switch b[j] {
+		case ' ':
+			if len(w.word) > 0 {
+				if err := w.flushWord(); err != nil {
+					return i, err
+				}
+				i = j
+			}
+			w.sp = b[i : j+1]
+			w.expectCol++
+
+		case '\t':
+			if len(w.word) > 0 {
+				if err := w.flushWord(); err != nil {
+					return i, err
+				}
+				i = j
+			}
+			w.sp = b[i : j+1]
+			w.expectCol += 8 - w.expectCol%8
+
+		case '\n':
+			if len(w.word) > 0 {
+				if err := w.flushWord(); err != nil {
+					return i, err
+				}
+			} else if w.col == 0 {
+				// blank line
+				w.sp = []byte{} // discard line's trailing whitespace
+				if err := w.writeLineLeader(); err != nil {
+					return i, err
+				}
+			}
+			if err := w.writeNewline(); err != nil {
+				return i, err
+			}
+			i = j + 1
+
+		default:
+			w.word = b[i+len(w.sp) : j+1]
+			w.expectCol++
+		}
+
+		if w.maxLineLen > 0 && w.expectCol >= w.maxLineLen && w.col != 0 {
+			// wrap line
+			if err := w.writeNewline(); err != nil {
+				return i, err
+			}
+		}
+	}
+
+	return len(b), nil
+}
+
+func (w *golangCommentWriter) Close() error {
+	var err error
+	if len(w.word) > 0 {
+		err = w.flushWord()
+	} // else ignore trailing whitespace
+	if err == nil && w.col != 0 {
+		err = w.writeNewline()
+	}
 	return err
 }
