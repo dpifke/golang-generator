@@ -3,6 +3,7 @@ package generator
 import (
 	"fmt"
 	"io"
+	"sync"
 )
 
 // WriteGolangHeader writes the file header for a generated Go source file to
@@ -56,13 +57,15 @@ func GolangCommentWriter(out io.Writer, indentLevel, maxLineLen int) io.WriteClo
 // golangCommentWriter is the package-private implementation returned by
 // GolangCommentWriter().
 type golangCommentWriter struct {
-	out         io.Writer // where to send formatted output
-	indentLevel int       // number of leading tabs
-	maxLineLen  int       // maximum characters per line
-	sp          []byte    // whitespace yet to be written
-	word        []byte    // word yet to be written
-	col         int       // column (0 indexed)
-	expectCol   int       // column if sp+word is written
+	out         io.Writer  // where to send formatted output
+	indentLevel int        // number of leading tabs
+	maxLineLen  int        // maximum characters per line
+	sp          []byte     // whitespace yet to be written
+	word        []byte     // word yet to be written
+	col         int        // column (0 indexed)
+	expectCol   int        // column if sp+word is written
+	needCopy    bool       // set if Write() returns without flush
+	mutex       sync.Mutex // Write() and Close() are not thread-safe
 }
 
 // writeNewline outputs a newline, and performs related housekeeping.
@@ -127,11 +130,24 @@ func (w *golangCommentWriter) flushWord() error {
 
 	w.sp = []byte{}
 	w.word = []byte{}
+	w.needCopy = false
 
 	return nil
 }
 
+// extendOrAppend returns a subslice from src, unless needCopy is set, in
+// which case it copies from src to dest.
+func (w *golangCommentWriter) extendOrAppend(dest, src []byte, i, j int) []byte {
+	if w.needCopy {
+		return append(dest, src[j])
+	}
+	return src[i : j+1]
+}
+
 func (w *golangCommentWriter) Write(b []byte) (int, error) {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
 	for i, j := 0, 0; j < len(b); j++ {
 		switch b[j] {
 		case ' ':
@@ -141,7 +157,7 @@ func (w *golangCommentWriter) Write(b []byte) (int, error) {
 				}
 				i = j
 			}
-			w.sp = b[i : j+1]
+			w.sp = w.extendOrAppend(w.sp, b, i, j)
 			w.expectCol++
 
 		case '\t':
@@ -151,7 +167,7 @@ func (w *golangCommentWriter) Write(b []byte) (int, error) {
 				}
 				i = j
 			}
-			w.sp = b[i : j+1]
+			w.sp = w.extendOrAppend(w.sp, b, i, j)
 			w.expectCol += 8 - w.expectCol%8
 
 		case '\n':
@@ -172,7 +188,7 @@ func (w *golangCommentWriter) Write(b []byte) (int, error) {
 			i = j + 1
 
 		default:
-			w.word = b[i+len(w.sp) : j+1]
+			w.word = w.extendOrAppend(w.word, b, i+len(w.sp), j)
 			w.expectCol++
 		}
 
@@ -184,10 +200,21 @@ func (w *golangCommentWriter) Write(b []byte) (int, error) {
 		}
 	}
 
+	if !w.needCopy && (len(w.sp) > 0 || len(w.word) > 0) {
+		// need to make a copy of unflushed data, since b may not be
+		// around when we want to flush it later
+		w.sp = append([]byte{}, w.sp...)
+		w.word = append([]byte{}, w.word...)
+		w.needCopy = true
+	}
+
 	return len(b), nil
 }
 
 func (w *golangCommentWriter) Close() error {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
 	var err error
 	if len(w.word) > 0 {
 		err = w.flushWord()

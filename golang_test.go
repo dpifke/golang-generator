@@ -49,7 +49,34 @@ func TestGolangCommentWriter(t *testing.T) {
 		}
 
 		if test.expect != b.String() {
-			t.Errorf("Expected %q, got %q", test.expect, b.String())
+			t.Errorf("expected %q, got %q", test.expect, b.String())
 		}
+	}
+}
+
+func TestRecycledCommentBuffer(t *testing.T) {
+	b := new(bytes.Buffer)
+	w := GolangCommentWriter(b, 0, 0)
+
+	// write a buffer as usual
+	buf := []byte("foo")
+	if _, err := w.Write(buf); err != nil {
+		t.Errorf("first Write() returned error: %s", err.Error())
+	}
+
+	// now recycle that buffer with different data to write
+	buf[0] = 'b'
+	buf[1] = 'a'
+	buf[2] = 'r'
+	if _, err := w.Write(buf); err != nil {
+		t.Errorf("second Write() returned error: %s", err.Error())
+	}
+
+	if err := w.Close(); err != nil {
+		t.Errorf("Close() returned error: %s", err.Error())
+	}
+	expect := "// foobar\n"
+	if b.String() != expect {
+		t.Errorf("expected %q, got %q", expect, b.String())
 	}
 }
